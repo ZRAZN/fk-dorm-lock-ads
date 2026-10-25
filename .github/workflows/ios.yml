@@ -1,0 +1,61 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Generate Xcode project
+        run: |
+          set -x
+          xcodegen generate
+          # 新版 XcodeGen 会写 objectVersion 77（Xcode 16 格式），
+          # 这里统一降级到 56，Xcode 15 / 16 都能读，避免 "future project file format"
+          sed -i '' 's/objectVersion = 77;/objectVersion = 56;/' DormLock.xcodeproj/project.pbxproj || true
+          grep -m1 objectVersion DormLock.xcodeproj/project.pbxproj
+
+      - name: Build archive
+        run: |
+          set -x
+          xcodebuild archive \
+            -project DormLock.xcodeproj \
+            -scheme DormLock \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/DormLock.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO
+
+      - name: Package IPA
+        run: |
+          ls -R build/DormLock.xcarchive/Products/Applications
+          mkdir -p build/Payload
+          cp -R build/DormLock.xcarchive/Products/Applications/DormLock.app build/Payload/
+          cd build && zip -qry DormLock.ipa Payload
+          ls -lh DormLock.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DormLock-unsigned-ipa
+          path: ios/build/DormLock.ipa
+          if-no-files-found: error

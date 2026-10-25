@@ -1,0 +1,29 @@
+# 构建产物
+build/
+.gradle/
+*.apk
+*.aab
+*.ipa
+*.xcarchive
+
+# 本地配置（含绝对路径，不要提交）
+local.properties
+
+# Web 自签证书（私钥！）
+web/cert.pem
+web/key.pem
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# 个人配置
+*.local
+.env

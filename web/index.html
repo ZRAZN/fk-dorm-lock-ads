@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#111">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>宿舍门锁</title>
+<script src="crypto-js.min.js"></script>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 18px;
+    background: #0b0b0d; color: #eee;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 24px;
+  }
+  h1 { font-size: 17px; font-weight: 500; color: #888; margin: 0; letter-spacing: .08em; }
+  #btn {
+    width: 200px; height: 200px; border-radius: 50%; border: none;
+    background: radial-gradient(circle at 35% 30%, #3a3a44, #1a1a20);
+    color: #fff; font-size: 26px; font-weight: 600; letter-spacing: .1em;
+    box-shadow: 0 10px 40px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.12);
+    transition: transform .12s, background .2s;
+    cursor: pointer;
+  }
+  #btn:active { transform: scale(.94); }
+  #btn.ok { background: radial-gradient(circle at 35% 30%, #1f7a45, #0d4526); }
+  #btn.err { background: radial-gradient(circle at 35% 30%, #8a2c2c, #4a1414); }
+  #btn:disabled { opacity: .5; }
+  #log {
+    width: 100%; max-width: 420px; height: 200px; overflow-y: auto;
+    background: #15151a; border-radius: 12px; padding: 12px;
+    font-family: ui-monospace, Consolas, monospace; font-size: 11px;
+    line-height: 1.65; color: #8a8a96; white-space: pre-wrap; word-break: break-all;
+  }
+  #log .k { color: #6cc4ff; }
+  #log .g { color: #5fd97f; }
+  #log .r { color: #ff6b6b; }
+  #log .y { color: #ffd166; }
+  .cfg { width: 100%; max-width: 420px; display: flex; gap: 8px; }
+  .cfg input {
+    flex: 1; background: #15151a; border: 1px solid #26262e; color: #ccc;
+    border-radius: 8px; padding: 9px 11px; font-size: 12px;
+    font-family: ui-monospace, monospace;
+  }
+  .cfg button {
+    background: #26262e; border: none; color: #aaa; border-radius: 8px;
+    padding: 0 14px; font-size: 12px;
+  }
+</style>
+</head>
+<body>
+
+<h1>宿 舍 门 锁</h1>
+<button id="btn">开锁</button>
+<div class="cfg">
+  <input id="mac" placeholder="MAC AA:BB:CC:DD:EE:FF">
+  <input id="key" placeholder="activationKey">
+  <button id="save">存</button>
+</div>
+<div id="log"></div>
+
+<script>
+/* ============================================================
+   VOC 蓝牙门锁 · 一键开锁
+   协议基于某款宿舍门锁 App 的客户端行为分析
+   ============================================================ */
+
+const SERVICE_UUID  = "00002760-08c2-11e1-9073-0e8ac72e1001";
+const RANDOM_REQ    = "55AAFF0D00000B";              // 请求随机数
+const LINK_ESTAB    = "55AAFF13000011";              // 建立加密链路
+const UNLOCK_PLAIN  = "FF0B0000090000000000000000000000";  // 开锁明文
+
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+
+function log(msg, cls) {
+  const t = new Date().toTimeString().slice(0, 8);
+  const span = cls ? `<span class="${cls}">${msg}</span>` : msg;
+  logEl.innerHTML += `[${t}] ${span}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+/* ---------- 算法 ---------- */
+const hexToBytes = h => new Uint8Array(h.match(/../g).map(x => parseInt(x, 16)));
+const bytesToHex = b => [...b].map(x => x.toString(16).padStart(2, "0")).join("");
+const checksum = h => (h.match(/../g).reduce((s, x) => s + parseInt(x, 16), 0) & 0xFF)
+                      .toString(16).padStart(2, "0");
+
+function xorHex(a, b) {
+  const A = hexToBytes(a), B = hexToBytes(b);
+  return bytesToHex(A.map((v, i) => v ^ B[i % B.length]));
+}
+
+function aesEcbEncrypt(keyHex, plainHex) {
+  const key = CryptoJS.enc.Hex.parse(keyHex);
+  const msg = CryptoJS.enc.Hex.parse(plainHex);
+  const out = CryptoJS.AES.encrypt(msg, key, {
+    mode: CryptoJS.mode.ECB,
+    padding: CryptoJS.pad.NoPadding
+  });
+  return out.ciphertext.toString(CryptoJS.enc.Hex);
+}
+
+function aesEcbDecrypt(keyHex, ctHex) {
+  const key = CryptoJS.enc.Hex.parse(keyHex);
+  const ct  = CryptoJS.enc.Hex.parse(ctHex);
+  const out = CryptoJS.AES.decrypt({ ciphertext: ct }, key, {
+    mode: CryptoJS.mode.ECB,
+    padding: CryptoJS.pad.NoPadding
+  });
+  return out.toString(CryptoJS.enc.Hex);
+}
+
+function buildUnlockFrame(randomNumber, activationKey) {
+  const sessionKey = xorHex(randomNumber, activationKey);
+  const ct = aesEcbEncrypt(sessionKey, UNLOCK_PLAIN);
+  const body = "55AA0010" + ct;
+  return { frame: (body + checksum(body)).toUpperCase(), sessionKey };
+}
+
+/* ---------- 配置持久化 ---------- */
+$("mac").value = localStorage.getItem("voc_mac") || "AA:BB:CC:DD:EE:FF";
+$("key").value = localStorage.getItem("voc_key") || "";
+$("save").onclick = () => {
+  localStorage.setItem("voc_mac", $("mac").value.trim());
+  localStorage.setItem("voc_key", $("key").value.trim());
+  log("配置已保存", "g");
+};
+
+/* ---------- 蓝牙流程 ---------- */
+let device = null;
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// BLE 默认 MTU 23 → 单包最多 20 字节，超出要手动分包（原 App 就是 20+1 两包）
+async function writeChunked(ch, bytes, size = 20) {
+  for (let i = 0; i < bytes.length; i += size) {
+    await ch.writeValue(bytes.slice(i, i + size));
+    if (i + size < bytes.length) await sleep(40);
+  }
+}
+
+async function getDevice() {
+  log("正在扫描附近所有蓝牙设备…", "y");
+  log("列表里会有很多同名门锁，随便选一个，连错了我让你重选", "y");
+  return await navigator.bluetooth.requestDevice({
+    acceptAllDevices: true,
+    optionalServices: [SERVICE_UUID]
+  });
+}
+
+async function getCachedDevice() {
+  const want = localStorage.getItem("voc_dev_id");
+  if (!want || !navigator.bluetooth.getDevices) return null;
+  try {
+    const known = await navigator.bluetooth.getDevices();
+    return known.find(d => d.id === want) || null;
+  } catch (e) { return null; }
+}
+
+async function pickAndConnect(mac) {
+  const macNorm = mac.replace(/[^0-9a-fA-F]/g, "").toLowerCase();
+
+  // 先用上次记住的那台 —— 真正的一键
+  const cached = await getCachedDevice();
+  if (cached) {
+    log("用上次记住的设备 " + (cached.name || cached.id), "k");
+    try {
+      const server = await cached.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      log("✓ 直连成功", "g");
+      return { dev: cached, server, service };
+    } catch (e) {
+      log("× 缓存设备连不上（" + (e.message || e) + "），重新扫描", "y");
+      localStorage.removeItem("voc_dev_id");
+      try { cached.gatt.disconnect(); } catch (_) { }
+    }
+  }
+
+  while (true) {
+    const dev = await getDevice();
+    const idNorm = (dev.id || "").replace(/[^0-9a-fA-F]/g, "").toLowerCase();
+    log("选中: " + (dev.name || "(无名)") + "   id=" + dev.id, "k");
+    if (idNorm && macNorm && idNorm === macNorm) {
+      log("✓ 地址和你的锁一致", "g");
+    }
+    try {
+      const server = await dev.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      log("✓ 这台有门锁服务，就是它 —— 已记住，下次直接连", "g");
+      localStorage.setItem("voc_dev_id", dev.id);
+      return { dev, server, service };
+    } catch (e) {
+      log("× 这台不是（" + (e.message || e) + "），换一个再试", "y");
+      try { dev.gatt.disconnect(); } catch (_) { }
+    }
+  }
+}
+
+async function collect(ch, ms) {
+  // 事件驱动：收到数据后静默 120ms 就返回，不等满 ms（门锁会话超时很紧）
+  return await new Promise(resolve => {
+    const chunks = [];
+    let timer = null;
+
+    function finish() {
+      clearTimeout(timer);
+      ch.removeEventListener("characteristicvaluechanged", handler);
+      const total = chunks.reduce((n, c) => n + c.length, 0);
+      const buf = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) { buf.set(c, off); off += c.length; }
+      resolve(bytesToHex(buf));
+    }
+
+    function handler(e) {
+      chunks.push(new Uint8Array(e.target.value.buffer));
+      clearTimeout(timer);
+      timer = setTimeout(finish, 120);
+    }
+
+    ch.addEventListener("characteristicvaluechanged", handler);
+    timer = setTimeout(finish, ms);
+  });
+}
+
+async function unlock() {
+  const btn = $("btn");
+  const mac = $("mac").value.trim();
+  const activationKey = $("key").value.trim().toLowerCase();
+
+  if (!activationKey || activationKey.length !== 32) {
+    log("activationKey 必须是 32 位 hex", "r");
+    btn.classList.add("err");
+    setTimeout(() => btn.classList.remove("err"), 900);
+    return;
+  }
+
+  btn.disabled = true;
+  try {
+    log("请求蓝牙设备…", "k");
+    const pick = await pickAndConnect(mac);
+    device = pick.dev;
+    const server = pick.server;
+    const service = pick.service;
+    const chars = await service.getCharacteristics();
+
+    let writeCh = null, notifyCh = null;
+    for (const c of chars) {
+      const p = c.properties;
+      if (p.write || p.writeWithoutResponse) writeCh = c;
+      if (p.notify || p.indicate) notifyCh = c;
+    }
+    if (!writeCh || !notifyCh) throw new Error("找不到 write/notify 特征");
+    log("特征就绪", "g");
+
+    await notifyCh.startNotifications();
+
+    // ① 请求随机数
+    log("① 请求随机数", "k");
+    const p1 = collect(notifyCh, 1200);
+    await writeChunked(writeCh, hexToBytes(RANDOM_REQ));
+    const resp1 = await p1;
+    if (resp1.length < 46) throw new Error("随机数响应异常: " + resp1);
+    const randomNumber = resp1.slice(14, 46);
+    log("   randomNumber = " + randomNumber, "");
+
+    const sessionKey = xorHex(randomNumber, activationKey);
+    log("② sessionKey = " + sessionKey, "");
+
+    // ③ 建立加密链路
+    log("③ 建立加密链路", "k");
+    const p2 = collect(notifyCh, 1200);
+    await writeChunked(writeCh, hexToBytes(LINK_ESTAB));
+    const resp2 = await p2;
+    if (resp2.length >= 40) {
+      try { log("   ack = " + aesEcbDecrypt(sessionKey, resp2.slice(8, 40)), ""); } catch (e) {}
+    }
+
+    // ④⑤⑥ 开锁（无响应自动重试）
+    const { frame } = buildUnlockFrame(randomNumber, activationKey);
+    let ok = false;
+    for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
+      log(`④ 开锁帧（第 ${attempt} 次） ` + frame, "k");
+      const p3 = collect(notifyCh, 1500);
+      await writeChunked(writeCh, hexToBytes(frame));
+      const resp3 = await p3;
+      log("   ← " + (resp3 || "(无响应)"), resp3 ? "" : "y");
+      if (resp3.length >= 40) {
+        try {
+          const pt = aesEcbDecrypt(sessionKey, resp3.slice(8, 40));
+          log("   解密: " + pt, "");
+          ok = pt.startsWith("ff0b");
+        } catch (e) {
+          log("   解密失败: " + e.message, "r");
+        }
+      }
+      if (!ok) await sleep(250);
+    }
+
+    if (ok) {
+      log("✓ 开锁成功", "g");
+      btn.classList.add("ok");
+      setTimeout(() => btn.classList.remove("ok"), 2200);
+      if (navigator.vibrate) navigator.vibrate([40, 60, 40]);
+    } else {
+      log("× 未确认成功，看响应", "r");
+      btn.classList.add("err");
+      setTimeout(() => btn.classList.remove("err"), 1200);
+    }
+
+    try { await notifyCh.stopNotifications(); } catch (e) {}
+    try { device.gatt.disconnect(); } catch (e) {}
+  } catch (e) {
+    log("× " + (e.message || e), "r");
+    btn.classList.add("err");
+    setTimeout(() => btn.classList.remove("err"), 1200);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("btn").onclick = unlock;
+
+if (!navigator.bluetooth) {
+  log("此浏览器不支持 Web Bluetooth。用 Android Chrome / Edge。", "r");
+}
+</script>
+</body>
+</html>
