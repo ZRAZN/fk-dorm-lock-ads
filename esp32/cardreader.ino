@@ -25,8 +25,9 @@
 #include <mbedtls/aes.h>
 
 // ==================== CONFIG ====================
-static const char *LOCK_MAC = "AA:BB:CC:DD:EE:FF";   // 改成你自己门锁的 MAC
-static const char *ACTIVATION_KEY = "00000000000000000000000000000000";  // 改成你自己的 activationKey
+// 改成你自己的门锁 MAC 与 activationKey（见根目录 README「怎么拿这两个参数」）
+static const char *LOCK_MAC = "AA:BB:CC:DD:EE:FF";
+static const char *ACTIVATION_KEY = "00000000000000000000000000000000";
 
 static const char *SVC_UUID   = "00002760-08c2-11e1-9073-0e8ac72e1001";
 static const char *CHUNK_STR  = "55AAFF0D00000B";
@@ -76,6 +77,13 @@ BLERemoteCharacteristic *chWrite = nullptr;
 BLERemoteCharacteristic *chNotify = nullptr;
 String rxBuf;
 uint32_t rxStamp = 0;
+String lastUid;
+uint32_t lastOkMs = 0;
+uint32_t lastLinkMs = 0;
+
+// 开锁成功后保持连接多久（毫秒）。60 秒内再刷是秒开，
+// 超过就主动断开，把门锁的 BLE 通道让给室友的手机。
+#define LINK_IDLE_MS 60000
 
 // ==================== 灯 ====================
 static void led(bool on) { digitalWrite(LED_PIN, on ? LOW : HIGH); }
@@ -156,7 +164,10 @@ static bool autoDetect(uint8_t &sckOut, uint8_t &misoOut, uint8_t &mosiOut, uint
           delay(3);
 
           uint8_t v = probeVersion(CAND[a], CAND[b], CAND[c], CAND[d]);
-          if (v == 0x92 || v == 0x91) {
+          // 正品是 0x92/0x91，部分国产兼容芯片（CV520 等）返回 0x82，
+          // 所以只要不是 0x00 / 0xFF 就认为读到了芯片
+          bool ok = (v != 0x00 && v != 0xFF);
+          if (ok) {
             sckOut = CAND[a]; misoOut = CAND[b]; mosiOut = CAND[c]; ssOut = CAND[d];
             Serial.printf("FOUND sck=%d miso=%d mosi=%d ss=%d ver=0x%02X\n",
                           sckOut, misoOut, mosiOut, ssOut, v);
@@ -192,6 +203,17 @@ static bool waitRx(uint32_t quietMs, uint32_t limitMs) {
   }
   return rxBuf.length() > 0;
 }
+
+// 收到完整帧立刻返回，不再干等静默窗口
+static bool waitFrame(const char *marker, int totalHex, uint32_t limitMs) {
+  uint32_t t0 = millis();
+  while (millis() - t0 < limitMs) {
+    int p = rxBuf.indexOf(marker);
+    if (p >= 0 && (int)rxBuf.length() >= p + totalHex) return true;
+    delay(3);
+  }
+  return rxBuf.indexOf(marker) >= 0;
+}
 static void writeChunked(const uint8_t *buf, int len) {
   int off = 0;
   while (off < len) {
@@ -210,32 +232,53 @@ static void sendFrame(const String &hex) {
   free(b);
 }
 static bool connectLock() {
-  client = BLEDevice::createClient();
-  if (!client->connect(BLEAddress(LOCK_MAC))) {
-    Serial.println("[BLE] connect failed");
-    delete client; client = nullptr; return false;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) { Serial.printf("[BLE] retry #%d\n", attempt); delay(400); }
+
+    client = BLEDevice::createClient();
+    if (!client->connect(BLEAddress(LOCK_MAC))) {
+      Serial.println("[BLE] connect failed");
+      delete client; client = nullptr; continue;
+    }
+
+    BLERemoteService *svc = client->getService(BLEUUID(SVC_UUID));
+    if (!svc) {
+      Serial.println("[BLE] no service");
+      client->disconnect(); delay(120); delete client; client = nullptr; continue;
+    }
+
+    chWrite = nullptr; chNotify = nullptr;
+    for (auto &kv : *svc->getCharacteristics()) {
+      BLERemoteCharacteristic *ch = kv.second;
+      if (!chWrite && ch->canWrite())  chWrite = ch;
+      if (!chNotify && ch->canNotify()) chNotify = ch;
+    }
+    if (!chWrite || !chNotify) {
+      Serial.println("[BLE] no char");
+      client->disconnect(); delay(120); delete client; client = nullptr; continue;
+    }
+
+    chNotify->registerForNotify(onNotify);
+    delay(80);
+    return true;
   }
-  BLERemoteService *svc = client->getService(BLEUUID(SVC_UUID));
-  if (!svc) { Serial.println("[BLE] no service"); client->disconnect(); delete client; client = nullptr; return false; }
-  chWrite = nullptr; chNotify = nullptr;
-  for (auto &kv : *svc->getCharacteristics()) {
-    BLERemoteCharacteristic *ch = kv.second;
-    if (!chWrite && ch->canWrite())  chWrite = ch;
-    if (!chNotify && ch->canNotify()) chNotify = ch;
-  }
-  if (!chWrite || !chNotify) { Serial.println("[BLE] no char"); client->disconnect(); delete client; client = nullptr; return false; }
-  chNotify->registerForNotify(onNotify);
-  delay(200);
-  return true;
+  return false;
 }
 static void disconnectLock() {
   chWrite = nullptr; chNotify = nullptr;
   if (client) { client->disconnect(); delete client; client = nullptr; }
 }
 
+// 保活：连接还在就直接复用，省掉 1~2 秒的连接 + 服务发现
+static bool ensureLink() {
+  if (client && client->isConnected() && chWrite && chNotify) return true;
+  disconnectLock();
+  return connectLock();
+}
+
 static bool doUnlock() {
   sendFrame(CHUNK_STR);
-  if (!waitRx(120, 1500)) { Serial.println("[1] no random"); return false; }
+  if (!waitFrame("55aaff0d", 48, 1500)) { Serial.println("[1] no random"); return false; }
   int p = rxBuf.indexOf("55aaff0d");
   if (p < 0) { Serial.println("[1] bad frame"); return false; }
   String rnd = rxBuf.substring(p + 14, p + 46);
@@ -248,7 +291,7 @@ static bool doUnlock() {
   Serial.println("[2] sessionKey=" + bytesToHex(sk, 16));
 
   sendFrame(LINK_STR);
-  if (!waitRx(120, 1500)) { Serial.println("[3] no ack"); return false; }
+  if (!waitFrame("55aa0010", 42, 1500)) { Serial.println("[3] no ack"); return false; }
   String ct;
   if (!pickCipher(rxBuf, ct)) { Serial.println("[3] no cipher"); return false; }
   uint8_t cbuf[16], pbuf[16];
@@ -270,7 +313,7 @@ static bool doUnlock() {
 
   rxBuf = "";
   writeChunked(frame, 21);
-  if (!waitRx(120, 1500)) { Serial.println("[4] no response"); return false; }
+  if (!waitFrame("55aa0010", 42, 1500)) { Serial.println("[4] no response"); return false; }
   String ct2;
   if (!pickCipher(rxBuf, ct2)) { Serial.println("[4] no cipher"); return false; }
   hexToBytes(ct2, cbuf, 16);
@@ -286,8 +329,19 @@ static String cardUid() {
   if (!rfid->PICC_ReadCardSerial()) return "";
   String s = bytesToHex(rfid->uid.uidByte, rfid->uid.size);
   s.toUpperCase();
-  rfid->PICC_HaltA();
+  // 注意：这里不能 HaltA，否则后面没法再对这张卡做扇区认证
   return s;
+}
+
+// 卡片用完复位：断一次射频让卡回到 IDLE。
+// 不能用 PICC_HaltA —— 进入 HALT 后卡不再应答 REQA，
+// 卡还贴着的话下一轮 IsNewCardPresent 永远返回 false，表现就是「要贴十几秒才反应」。
+static void haltCard() {
+  rfid->PCD_StopCrypto1();
+  rfid->PCD_AntennaOff();
+  delay(3);
+  rfid->PCD_AntennaOn();
+  delay(5);
 }
 static bool allowed(const String &uid) {
   if (ALLOW_COUNT == 0) return true;
@@ -296,14 +350,35 @@ static bool allowed(const String &uid) {
 }
 
 // 校验卡内通行证。返回 0=通过 1=认证失败 2=口令不符 3=读取失败
+// 关键：认证前必须把天线关一次再开，让卡回到 IDLE 重新选一次。
+// 否则这颗兼容芯片（CV520）上直接 auth 会报 ERROR/超时。
+static bool reselectCard() {
+  rfid->PCD_StopCrypto1();
+  rfid->PCD_AntennaOff();
+  delay(6);
+  rfid->PCD_AntennaOn();
+  delay(30);   // 等射频场稳定、卡重新上电
+  for (int i = 0; i < 6; i++) {
+    if (rfid->PICC_IsNewCardPresent() && rfid->PICC_ReadCardSerial()) return true;
+    delay(15);
+  }
+  return false;
+}
+
 static int checkPass() {
   MFRC522::MIFARE_Key k;
   memcpy(k.keyByte, PASS_KEY_A, 6);
 
-  MFRC522::StatusCode st =
-      rfid->PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, PASS_BLOCK, &k, &rfid->uid);
-  if (st != MFRC522::STATUS_OK) {
-    Serial.printf("  pass: auth fail (%d)\n", (int)st);
+  MFRC522::StatusCode st = MFRC522::STATUS_ERROR;
+  bool got = false;
+  for (int attempt = 0; attempt < 6; attempt++) {
+    if (!reselectCard()) { delay(15); continue; }
+    st = rfid->PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, PASS_BLOCK, &k, &rfid->uid);
+    if (st == MFRC522::STATUS_OK) { got = true; break; }
+    delay(15);
+  }
+  if (!got) {
+    Serial.printf("  pass: auth fail (%d) after 6 tries\n", (int)st);
     return 1;
   }
 
@@ -411,22 +486,28 @@ void setup() {
   delay(200);
   Serial.println("\n=== door card reader (autodetect) ===");
 
-  uint8_t sck, miso, mosi, ss;
-  bool ok = autoDetect(sck, miso, mosi, ss);
-  if (!ok) {
-    Serial.println("!! 没有找到能读到 RC522 的接线组合");
-    blink(9, 90);   // 9 下快闪 = 探测失败
-    // 继续跑，万一只是偶发
-    SPI.begin(4, 5, 6, 7);
-    rfid = new MFRC522(7, RST_PIN);
+  // 接线已固定：SCK=4 MISO=5 MOSI=6 SS=7，不再自动探测（自动探测会被悬空脚误判）
+  const uint8_t sck = 4, miso = 5, mosi = 6, ss = 7;
+  SPI.begin(sck, miso, mosi, ss);
+  rfid = new MFRC522(ss, RST_PIN);
+  rfid->PCD_Init();
+  delay(80);
+
+  // 冷启动时 RC522 常常还没就绪，读到 0x00/0xFF 就重初始化再读
+  uint8_t ver = rfid->PCD_ReadRegister(MFRC522::VersionReg);
+  for (int i = 0; i < 12 && (ver == 0x00 || ver == 0xFF); i++) {
+    delay(250);
+    rfid->PCD_Init();
+    delay(60);
+    ver = rfid->PCD_ReadRegister(MFRC522::VersionReg);
+  }
+  Serial.printf("version now 0x%02X\n", ver);
+  if (ver == 0x00 || ver == 0xFF) {
+    Serial.println("!! RC522 无响应（检查供电/线）");
+    blink(9, 90);
   } else {
-    SPI.begin(sck, miso, mosi, ss);
-    rfid = new MFRC522(ss, RST_PIN);
     blink(2, 600);   // 2 下慢闪 = 探测成功
   }
-  rfid->PCD_Init();
-  delay(100);
-  Serial.printf("version now 0x%02X\n", rfid->PCD_ReadRegister(MFRC522::VersionReg));
 
   BLEDevice::init("door-reader");
   Serial.println("ready");
@@ -440,36 +521,61 @@ void loop() {
     if (millis() - t0 >= 2500) { writeMode(); delay(800); return; }
   }
 
+  // 空闲太久就主动断开，别长期占着门锁的 BLE 通道
+  if (client && lastLinkMs && millis() - lastLinkMs > LINK_IDLE_MS) {
+    Serial.println("[BLE] idle timeout, releasing");
+    disconnectLock();
+  }
+
   String uid = cardUid();
   if (uid.isEmpty()) { delay(60); return; }
 
+  // 同一张卡开锁后 5 秒内不再重复触发（卡一直贴着时防止连环开门）
+  if (uid.equalsIgnoreCase(lastUid) && millis() - lastOkMs < 5000) {
+    haltCard();
+    delay(200);
+    return;
+  }
+
   Serial.println("card: " + uid);
-  blink(3, 150);   // 3 下 = 读到卡
+  uint32_t tCard = millis();
 
   for (int i = 0; i < DENY_COUNT; i++) {
     if (uid.equalsIgnoreCase(DENY_UID[i])) {
       Serial.println("  -> 黑名单卡，拒绝");
       blink(3, 500);
+      haltCard();
       delay(800);
       return;
     }
   }
 
-  if (!allowed(uid)) { blink(3, 500); delay(800); return; }
+  if (!allowed(uid)) { blink(3, 500); haltCard(); delay(800); return; }
 
+  // 注意：这里不要插任何闪灯/延时。选卡后必须立刻认证，
+  // 中间停顿会让这张卡进入不可认证状态（实测停顿 900ms 后必失败）。
   int pr = checkPass();
-  rfid->PCD_StopCrypto1();
   if (pr != 0) {
-    Serial.println("  -> 卡内口令校验失败，不开锁");
-    blink(pr == 2 ? 5 : 7, 200);
-    delay(800);
+    Serial.printf("  -> 卡内口令校验失败(code %d)，不开锁\n", pr);
+    blink(pr == 2 ? 5 : 7, 90);
+    haltCard();
+    delay(300);
     return;
   }
+  haltCard();
 
-  if (!connectLock()) { blink(4, 250); delay(1500); return; }
+  bool reusedLink = (client && client->isConnected() && chWrite && chNotify);
+  if (!ensureLink()) { blink(4, 250); haltCard(); delay(800); return; }
   bool okk = doUnlock();
-  disconnectLock();
-  Serial.println(okk ? "*** UNLOCK OK ***" : "*** FAILED ***");
+  // 成功就保持连接，下次刷卡直接复用；失败则断开，下次重连
+  if (!okk) disconnectLock();
+  lastLinkMs = millis();
+  Serial.printf("*** %s *** total %lu ms (link was %s)\n",
+                okk ? "UNLOCK OK" : "FAILED",
+                (unsigned long)(millis() - tCard),
+                reusedLink ? "reused" : "new");
+  if (okk) { lastUid = uid; lastOkMs = millis(); }
   blink(okk ? 6 : 4, 90);
-  delay(1500);
+  haltCard();
+  delay(400);
 }
